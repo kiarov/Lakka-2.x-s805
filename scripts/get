@@ -1,0 +1,216 @@
+#!/bin/bash
+
+################################################################################
+#      This file is part of LibreELEC - https://libreelec.tv
+#      Copyright (C) 2017-present Team LibreELEC
+#
+#  LibreELEC is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 2 of the License, or
+#  (at your option) any later version.
+#
+#  LibreELEC is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with LibreELEC.  If not, see <http://www.gnu.org/licenses/>.
+################################################################################
+
+. config/options $1
+
+_get_file_already_downloaded() {
+  if [ -f $PACKAGE ]; then
+    if [ "$(cat $STAMP_URL 2>/dev/null)" == "${PKG_URL}" -o "$(cat $STAMP_URL 2>/dev/null)" == "${PKG_GIT_URL}" ]; then
+      [ -z "${PKG_SHA256}" -o "$(cat $STAMP_SHA 2>/dev/null)" == "${PKG_SHA256}" ] && return 0
+    fi
+  fi
+  return 1
+}
+
+if [ -z "$1" ]; then
+  for i in `find packages/ -type f -name package.mk`; do
+    GET_PKG=`grep ^PKG_NAME= $i | sed -e "s,\",,g" -e "s,PKG_NAME=,,"`
+    $SCRIPTS/get $GET_PKG
+  done
+fi
+
+if [ -z "$PKG_URL" -o -z "$PKG_SOURCE_NAME" ]; then
+  if [ -z "$PKG_GIT_URL" -o -z "$PKG_SOURCE_NAME" ]; then
+    exit 0
+  fi
+fi
+
+if [ -n "$PKG_GIT_URL" -a -n "$PKG_URL" ]; then
+  echo -e "${boldred}ERROR${endcolor} Package '$PKG_NAME' has PKG_URL and PKG_GIT_URL defined. Concurrent usage of both is not supported. Use only one of those!"
+  exit 1
+fi
+
+mkdir -p $SOURCES/$1
+
+PACKAGE="$SOURCES/$1/$PKG_SOURCE_NAME"
+PACKAGE_MIRROR="$DISTRO_MIRROR/$PKG_NAME/$PKG_SOURCE_NAME"
+[ "$VERBOSE" != "yes" ] && WGET_OPT=-q
+WGET_CMD="wget --timeout=30 --tries=3 --passive-ftp --no-check-certificate -c $WGET_OPT -O $PACKAGE"
+
+STAMP_URL="$PACKAGE.url"
+STAMP_SHA="$PACKAGE.sha256"
+
+# Latest file already present, exit now...
+_get_file_already_downloaded $1 && exit 0
+
+# Avoid concurrent downloads of the same package
+_isblocked=N
+exec 99<$SOURCES/$1
+while ! flock --nonblock --exclusive 99; do
+  [ ${_isblocked} == N ] && { echo "Project/Device ${DEVICE:-${PROJECT}} waiting, to avoid concurrent download of ${1}..."; _isblocked=Y; }
+  sleep 1
+done
+
+# Check again in case of concurrent access - if nothing needs to be downloaded, exit now...
+_get_file_already_downloaded $1 && exit 0
+
+# At this point, we need to download something...
+printf "%${BUILD_INDENT}c ${boldcyan}GET${endcolor}      $1\n" ' '>&$SILENT_OUT
+export BUILD_INDENT=$((${BUILD_INDENT:-1}+$BUILD_INDENT_SIZE))
+
+# unset LD_LIBRARY_PATH to stop wget from using toolchain/lib and loading libssl.so/libcrypto.so instead of host libraries
+unset LD_LIBRARY_PATH
+
+rm -f $STAMP_URL $STAMP_SHA
+
+if [ -n "$PKG_GIT_URL" -a -z "$PKG_URL" ]; then
+
+  if [ -n "$LAKKA_MIRROR" ]; then
+    PACKAGE_MIRROR="$LAKKA_MIRROR/$PKG_SOURCE_NAME"
+    if [ "$NO_MIRROR" == "yes" ]; then
+      NBWGET=0
+    else
+      NBWGET=5
+    fi
+
+    # first look if we have tarball mirrored
+    while [ $NBWGET -gt 0 ]; do
+      rm -f $PACKAGE
+
+      if $WGET_CMD "$PACKAGE_MIRROR"; then
+        break
+      fi
+
+      NBWGET=$((NBWGET - 1))
+      rm -f $PACKAGE
+    done
+
+    if [ $NBWGET -eq 0 ]; then
+      # no tarball on mirror - clone and create tarball
+      CUR_PWD="$(pwd)"
+      GIT_REPO_FOLDER="$SOURCES/$1/repo"
+      REPO_FRESH=0
+
+      # remove stale folders if they exist
+      rm -rf $SOURCES/$1/$PKG_NAME-*/
+
+      if [ ! -d "$GIT_REPO_FOLDER" ]; then
+        printf "%${BUILD_INDENT}c ${boldcyan}GIT CLONE${endcolor}    $1\n" ' '>&$SILENT_OUT
+        git clone $PKG_GIT_URL $GIT_REPO_FOLDER
+        cd $GIT_REPO_FOLDER
+        REPO_FRESH=1
+      else
+        cd $GIT_REPO_FOLDER
+        REPO_FOLDER_ORIGIN=$(git remote get-url origin || echo ERROR)
+        if [ "$PKG_GIT_URL" != "$REPO_FOLDER_ORIGIN" ]; then
+          printf "%${BUILD_INDENT}c ${boldred}WARNING${endcolor} $1 git remote changed\n" ' '>&$SILENT_OUT
+          cd ..
+          rm -rf repo
+          printf "%${BUILD_INDENT}c ${boldcyan}GIT CLONE${endcolor}    $1\n" ' '>&$SILENT_OUT
+          git clone $PKG_GIT_URL repo
+          cd repo
+          REPO_FRESH=1
+        fi
+      fi
+
+      if [ $REPO_FRESH -eq 1 ]; then
+        if [ -n "$PKG_GIT_BRANCH" ]; then
+          printf "%${BUILD_INDENT}c ${boldcyan}GIT CHECKOUT BRANCH${endcolor} $1 - $PKG_GIT_BRANCH\n" ' '>&$SILENT_OUT
+          git checkout -b $PKG_GIT_BRANCH origin/$PKG_GIT_BRANCH || {
+            echo "ERROR: branch '$PKG_GIT_BRANCH' does not exist!"
+            exit 1
+          }
+        fi
+      else
+        printf "%${BUILD_INDENT}c ${boldred}GIT CLEAN${endcolor} $1\n" ' '>&$SILENT_OUT
+        git clean -fdx
+        git checkout -- .
+        if [ -n "$PKG_GIT_BRANCH" ]; then
+          REPO_FOLDER_BRANCH=$(git branch | grep ^\* | cut -d' ' -f2)
+          if [ "$PKG_GIT_BRANCH" != "$REPO_FOLDER_BRANCH" ]; then
+            printf "%${BUILD_INDENT}c ${boldcyan}GIT FETCH${endcolor} $1 branch changed\n" ' '>&$SILENT_OUT
+            git fetch
+            printf "%${BUILD_INDENT}c ${boldcyan}GIT CHECKOUT BRANCH${endcolor} $1 - $PKG_GIT_BRANCH\n" ' '>&$SILENT_OUT
+            git checkout -b $PKG_GIT_BRANCH origin/$PKG_GIT_BRANCH || {
+              echo "ERROR: branch '$PKG_GIT_BRANCH' does not exist!"
+              exit 1
+            }
+          fi
+        fi
+        printf "%${BUILD_INDENT}c ${boldcyan}GIT PULL${endcolor} $1\n" ' '>&$SILENT_OUT
+        git pull
+      fi
+      printf "%${BUILD_INDENT}c ${boldcyan}GIT VERSION${endcolor} $1 - $PKG_VERSION\n" ' '>&$SILENT_OUT
+      git reset --hard $PKG_VERSION
+      printf "%${BUILD_INDENT}c ${boldcyan}GIT SUBMODULE${endcolor} $1\n" ' '>&$SILENT_OUT
+      git submodule update --init --recursive
+      cd "$ROOT/$SOURCES/$1"
+      mv repo $PKG_NAME-$PKG_VERSION
+      printf "%${BUILD_INDENT}c ${boldcyan}GIT PACK${endcolor} $1\n" ' '>&$SILENT_OUT
+      echo -n "Creating tarball..."
+      tar -pcJf $ROOT/$PACKAGE $PKG_NAME-$PKG_VERSION
+      echo "done!"
+      mv $PKG_NAME-$PKG_VERSION repo
+      cd "$CUR_PWD"
+    fi
+
+    CALC_SHA256="$(sha256sum $PACKAGE | cut -d" " -f1)"
+
+    if [ -z "${PKG_SHA256}" -o "${PKG_SHA256}" == "${CALC_SHA256}" ]; then
+      printf "${boldgreen}INFO${endcolor} Calculated checksum is: ${CALC_SHA256}\n\n"
+    else
+      printf "${boldred}WARNING${endcolor} Incorrect checksum calculated on downloaded file: got ${CALC_SHA256}, wanted ${PKG_SHA256}\n\n"
+    fi
+
+    echo "${PKG_GIT_URL}" > $STAMP_URL
+    echo "${CALC_SHA256}" > $STAMP_SHA
+
+  else
+    echo -e "${boldred}WARNING${endcolor} Package '$PKG_NAME' not downloaded! Use\n\n\tDISTRO=Lakka $0\n\nto download Lakka libretro git-based packages!\n\n"
+  fi
+
+  exit 0
+
+fi
+
+NBWGET=10
+while [ $NBWGET -gt 0 ]; do
+  rm -f $PACKAGE
+
+  if $WGET_CMD "$PKG_URL" || $WGET_CMD "$PACKAGE_MIRROR"; then
+    CALC_SHA256="$(sha256sum $PACKAGE | cut -d" " -f1)"
+
+    [ -z "${PKG_SHA256}" -o "${PKG_SHA256}" == "${CALC_SHA256}" ] && break
+
+    printf "${boldred}WARNING${endcolor} Incorrect checksum calculated on downloaded file: got ${CALC_SHA256}, wanted ${PKG_SHA256}\n\n"
+  fi
+  NBWGET=$((NBWGET - 1))
+done
+
+if [ $NBWGET -eq 0 ]; then
+  echo -e "\nCant't get $1 sources : $PKG_URL\n Try later !!"
+  exit 1
+else
+  printf "${boldgreen}INFO${endcolor} Calculated checksum is: ${CALC_SHA256}\n\n"
+  echo "${PKG_URL}" > $STAMP_URL
+  echo "${CALC_SHA256}" > $STAMP_SHA
+fi
+
+exit 0
